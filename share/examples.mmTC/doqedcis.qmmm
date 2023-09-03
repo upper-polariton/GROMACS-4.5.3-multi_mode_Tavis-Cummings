@@ -1,0 +1,210 @@
+#!/bin/bash 
+# 
+# Please read this carefully, you may need to change it on a few locations
+#
+# wrapper to call TeraChem, convert in- and output with some (tedious)
+# awk scripting into the 'old' formats and perform the call to the
+# standard g09/g03 installed on the system.  For reasons I don't
+# understand the system() routine does not like long filenames. I
+# therefore call this script gau
+# 
+# To make gromacs aware of it, use GAUSS_EXE (even if using TeraChem):
+#
+# export GAUSS_EXE=gau
+#
+# Also make sure that gromacs can find it by using the full path
+# localtion to this file:
+#
+# export GAUSS_DIR=
+#
+
+source /users/groenhof/TeraChem/SetTCVars.sh
+# let gromacs write a "normal" gaussian input file, using the keyword
+# determined by the User's input. Alternatively, it is possible now to
+# provide different keywords by placing a header.com in the
+# directory. This will take precedence over the gromacs keywords.
+
+# create some temporary files
+if [ -e temp.com ] 
+    then
+	rm -fr temp.com
+fi
+
+# Use the knowledge on the input structure to extract the coordinates, etc.
+awk -v w=0 '{if (w == 1) print}{if ( $1 == "input-file") w=1}' input.com >> temp.com
+# IN order to get the gradients on the MM point charges, we request
+# gaussian to compute te electrostatic gradients on these centers. We
+# thus need to provide the coordinates of the MM charges once more. We
+# again use our knowledge of the input structure and simply wait until
+# we have read in three whitelines, which means we have arrived at the
+# point charges field.
+#
+# Note that TeraChem ALWAYS requires these positions to be in angstrom, 
+# even if units=bohr!
+
+bMM=$((`grep  Charge input.com|wc -w`))
+
+if [ $bMM -gt 0 ]
+then
+  awk -v nlines=0 '{if (nlines > 2) printf "%12.10lf %12.10lf %12.10lf %12.10lf\n", $4,$1*0.529177249,$2*0.529177249,$3*0.529177249}{if ($1||$2) ;else nlines++ }' input.com > pointcharges.txt
+
+  nrmm=$((`wc -l pointcharges.txt|awk '{print $1}'` - 1))
+  echo $nrmm > mm.xyz
+  echo >> mm.xyz
+  head -$nrmm pointcharges.txt >> mm.xyz
+  nrqm=$((-`wc -l pointcharges.txt|awk '{print $1}'` + `wc -l temp.com|awk '{print $1}'`))
+  head -$nrqm temp.com |awk '{if ($3) print}' > tempQMcoord.txt
+else
+  echo "only QM atoms"
+  awk '{if ($3) print}' temp.com > tempQMcoord.txt
+fi
+# now we replace the atomic number with the element symbol and convert to Angstrom.
+sed 's/ 1 / H /g;s/ 6 / C /g;s/ 7 / N /g;s/ 8 / O /g;s/ 16 /  S /g' tempQMcoord.txt > tempQMcoord_new.txt
+awk '{printf " %s %12.10lf %12.10lf %12.10lf\n",$1, $2*0.529177249,$3*0.529177249,$4*0.529177249}' tempQMcoord_new.txt > tempQMcoord.txt
+nrqm=$((`wc -l tempQMcoord.txt|awk '{print $1}'`))
+echo $nrqm > qm.xyz
+echo >> qm.xyz
+cat tempQMcoord.txt >> qm.xyz
+
+# Now the coordinate parts of the input file is in principle ready and we can m
+# ake a call to
+# terachem
+# We use two input files, one for the ground state and one for the excited 
+# that is resonancnt with the cavity photon. We call these s1.dat and s0.dat
+# these files are expected to be present and thus must be wirtten beforehand.
+
+terachem s0.dat  > s0.out
+
+if [ -d ./scr.qm ]; then
+rm -rf scr
+cp -r scr.qm scr
+fi
+
+
+# to remove spurisouo scr dirs
+
+#rm -rf scr
+#mv scr.qm scr
+
+
+
+# now grep out of the terachem output ( s0.out ) the energy and gradients
+#
+# First the MM gradients
+if [ $bMM -gt 0 ]
+then
+  echo $nrmm > mmgrad.tmp
+  echo >> mmgrad.tmp
+  awk -v start=10000000000 '{if ($2 == "MM" && $4 == "Point")  start=NR ;else if ( NR > start  ) print  }' s0.out|head -$nrmm >> mmgrad.tmp
+
+# remove MM self interactons
+~/Puhti-scripts/remove_MM_self mm.xyz mmgrad.xyz
+
+  grep "Energy" mmgrad.xyz |awk '{printf "%12.10lf",$2}' > mmener.dat
+
+  grep "FINAL ENERGY:" s0.out  |awk '{print $3}' > qmmmener.dat
+# add the corrected QMMM ener to S0.7 which is read by gromacs
+  paste qmmmener.dat mmener.dat|awk '{printf "%12.10lf\n",$1-$2}' > S0.7
+else
+  grep "FINAL ENERGY:" s0.out  |awk '{print $3}' > S0.7
+fi
+# Add gradients on the QM atoms
+tail -$nrqm ./scr/grad.xyz|awk '{printf "%12.10lf %12.10lf %12.10lf\n",$2,$3,$4}' >> S0.7
+
+# Now correct the MM self interactions in the MM gradients
+if [ $bMM -gt 0 ]
+then
+  paste mmgrad.xyz mmgrad.tmp|awk '{if ($5) printf "%12.10lf %12.10lf %12.10lf\n",$4+$1,$5+$2,$6+$3}' >> S0.7
+fi
+# now call the second time terachem to get the excited state gradients, energy
+# and dipole moment. We will overwrite grad.xyz,  but that does not matter
+
+status=1
+terachem s1.dat  > s1.out
+if [ -d ./scr.qm ]; then
+rm -rf scr
+mv scr.qm scr
+fi
+
+echo "terachem done on boht S1 and S0"
+
+# get the uncorrected MM gradients
+if [ $bMM -gt 0 ]
+then
+  echo $nrmm > mmgrad.tmp
+  echo >> mmgrad.tmp
+  awk -v start=10000000000 -v first=0 '{if ( ($2 == "MM" && $4 == "Point")&& first==1) start=NR ;else if ( NR > start  ) print  }{if ($2 == "MM" && $4 == "Point") first=1}' s1.out|head -$nrmm >> mmgrad.tmp
+#  awk -v start=10000000000 '{if ($2 == "MM" && $4 == "Point")  start=NR ;else if ( NR > start  ) print  }' s1.out|head -$nrmm >> mmgrad.tmp
+
+# correct the total energy by subtracting the MM self interactions and write to
+# the S1.7 mmgrad.xyz and mmener.dat are same as before, so no need to compute again
+
+
+  awk -v start=1000000000 '{if ($1 == "Root" && $3==$9 ) start=NR+2;else if (NR == start) printf "%12.10lf\n",$2 }' s1.out > qmmmener.dat
+  paste qmmmener.dat mmener.dat|awk '{printf "%12.10lf\n",$1-$2}' > S1.7
+else
+  awk -v start=1000000000 '{if ($1 == "Root" && $3==$9 ) start=NR+2;else if (NR == start) printf "%12.10lf\n",$2 }' s1.out > S1.7
+fi
+
+
+# getting S1 gradients on the QM atoms
+
+tail -$nrqm ./scr/grad.xyz|awk '{printf "%12.10lf %12.10lf %12.10lf\n",$2,$3,$4}' >> S1.7
+
+# corret the gradients of the MM atoms  as before
+
+if [ $bMM -gt 0 ]
+then
+  paste mmgrad.xyz mmgrad.tmp|awk '{if ($5) printf "%12.10lf %12.10lf %12.10lf\n",$4+$1,$5+$2,$6+$3}' >> S1.7
+fi
+
+# picking up the trasnition dipole moment
+awk -v start=1000000000 '{if ($1 == "Root" && $2=="Tx" && $3="Ty" ) start=NR+2;else if (NR == start) printf "%12.10lf %12.10lf %12.10lf\n",$2 ,$3,$4}' s1.out |head -1 >> S1.7
+
+# picking up the transition dipole moment derivatives
+# we read these as:
+#
+#  Nabla MuX
+#  Nabla MuY
+#  Nabla MuZ
+#
+echo "picking up dipole gradients"
+awk -v start=1000000000 '{if ($1 == "Atom" && $2=="dMuX/dX" ) start=NR+1;else if (NR  > start) printf "%12.10lf %12.10lf %12.10lf\n",$2 ,$3,$4}' s1.out > temp
+head -$nrqm  temp >> S1.7
+
+awk -v start=1000000000 '{if ($1 == "Atom" && $2=="dMuY/dX" && $3="DMuY/dY" ) start=NR+1;else if (NR  > start) printf "%12.10lf %12.10lf %12.10lf\n",$2 ,$3,$4}' s1.out  > temp
+head -$nrqm temp >> S1.7
+
+awk -v start=1000000000 '{if ($1 == "Atom" && $2=="dMuZ/dX" && $3="DMuZ/dY" ) start=NR+1;else if (NR  > start) printf "%12.10lf %12.10lf %12.10lf\n",$2 ,$3,$4}' s1.out  > temp
+head -$nrqm  temp >> S1.7
+
+
+# MM
+if [ $bMM -gt 0 ]
+then
+
+  awk -v start=1000000000 '{if ($1 == "Atom" && $2=="dMuX_MM/dX" ) start=NR+1;else if (NR  > start) printf "%12.10lf %12.10lf %12.10lf\n",$2 ,$3,$4}' s1.out > temp
+  head -$nrmm  temp >> S1.7
+
+  awk -v start=1000000000 '{if ($1 == "Atom" && $2=="dMuY_MM/dX" && $3="DMuY/dY" ) start=NR+1;else if (NR  > start) printf "%12.10lf %12.10lf %12.10lf\n",$2 ,$3,$4}' s1.out  > temp
+  head -$nrmm temp >> S1.7
+
+  awk -v start=1000000000 '{if ($1 == "Atom" && $2=="dMuZ_MM/dX" && $3="DMuZ/dY" ) start=NR+1;else if (NR  > start) printf "%12.10lf %12.10lf %12.10lf\n",$2 ,$3,$4}' s1.out  > temp
+  head -$nrmm  temp >> S1.7
+
+fi
+
+
+echo "picked up the gradients"
+
+
+
+#picking up dipole gradients for the MM atoms
+
+
+# finally we need the CI coefficients to do diabatic hopping 
+# since this script is for CIS, we skip this for now.
+
+# fake non-adiabatic couplings
+awk '{printf "%lf %lf %lf\n",0.0,0.0,0.0}' tempQMcoord.txt >> S1.7
+rm -rf scr.qm.*
